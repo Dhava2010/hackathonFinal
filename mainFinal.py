@@ -1,314 +1,131 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-🎯 Hackathon 2025 — Target Tracker (Low-Power Version)
-- Optimized for USB cameras on Raspberry Pi
-- 180p @ 10 FPS for low power draw
-- Detects green targets & triggers servo (GPIO 18)
-"""
-
-import cv2
+import cv2 as cv
 import numpy as np
 import time
-import sys
+import RPi.GPIO as GPIO
 
-# =============================
-#        CONFIGURATION
-# =============================
-
-CAMERA_INDEX = 0
-CAMERA_BACKEND = cv2.CAP_V4L2
-CAMERA_WIDTH = 320
-CAMERA_HEIGHT = 180
-CAMERA_FPS = 10
-
-LINE_Y_REL = 0.70
-LINE_THICKNESS = 10
-SEGMENT_MARGIN = 0.2
-
-GREEN_LOW  = np.array([40, 50, 50])
-GREEN_HIGH = np.array([80, 255, 255])
-MIN_AREA = 800
-ASPECT_MAX = 4.0
-FILL_MIN = 0.3
-
-MAX_DIST = 80
-MAX_MISSES = 5
-MIN_FRAMES_TO_CONFIRM = 2
-
-# ⚙️ SERVO (GPIO 18 = Pin 12)
+# =======================
+# Servo setup (BCM mode)
+# =======================
+GPIO.setmode(GPIO.BCM)
 SERVO_PIN = 18
-SERVO_FREQ = 50
-SERVO_MIN_US = 500
-SERVO_MAX_US = 2500
-REST_ANGLE = 90
-FIRE_ANGLE = 30
-FIRE_HOLD = 0.12
-RETURN_HOLD = 0.08
+GPIO.setup(SERVO_PIN, GPIO.OUT)
 
-# =============================
-#        SERVO CONTROLLER
-# =============================
+# 50 Hz PWM (typical hobby servo)
+pwm = GPIO.PWM(SERVO_PIN, 50)
+pwm.start(0)
 
-class ServoController:
-    def __init__(self, pin=SERVO_PIN, freq=SERVO_FREQ,
-                 min_us=SERVO_MIN_US, max_us=SERVO_MAX_US, debug=False):
-        self.pin = pin
-        self.freq = freq
-        self.min_us = min_us
-        self.max_us = max_us
-        self.debug = debug
-        self.current_angle = REST_ANGLE
-        self._dry_run = False
+def set_angle(angle, settle=0.4):
+    """Move servo to an angle (0–180)."""
+    duty = 2 + (angle / 18.0)  # ~2%→0°, ~12%→180°
+    pwm.ChangeDutyCycle(duty)
+    time.sleep(settle)
+    # reduce jitter
+    pwm.ChangeDutyCycle(0)
 
-        try:
-            import lgpio
-            self.lgpio = lgpio
-            self.chip = lgpio.gpiochip_open(0)
-            lgpio.gpio_claim_output(self.chip, self.pin)
-            print("[✅ SERVO] Hardware PWM active (lgpio)")
-            self.set_angle(self.current_angle, hold=0.1)
-        except Exception as e:
-            print(f"[⚠️ SERVO] lgpio failed → dry-run mode only ({e})")
-            self._dry_run = True
+def fire_servo():
+    """Simple 'press trigger' motion: forward then back."""
+    print("FIRING")
+    # adjust angles & delays to match your mechanism throw
+    set_angle(180, settle=0.25)
+    time.sleep(0.15)
+    set_angle(90, settle=0.25)
 
-    def _angle_to_duty(self, angle):
-        angle = np.clip(angle, 0, 180)
-        pulse_us = self.min_us + (angle / 180.0) * (self.max_us - self.min_us)
-        period_us = 1_000_000 / self.freq
-        return (pulse_us / period_us) * 100.0
+# =======================
+# Vision setup
+# =======================
+LOWER_GREEN = np.array([35, 60, 50], dtype=np.uint8)
+UPPER_GREEN = np.array([85, 255, 255], dtype=np.uint8)
 
-    def set_angle(self, angle, hold=0.05):
-        angle = float(np.clip(angle, 0, 180))
-        self.current_angle = angle
-        if self._dry_run:
-            if self.debug:
-                print(f"[DRY] servo → {angle:.1f}° (hold {hold}s)")
-            time.sleep(hold)
-            return
-        try:
-            duty = self._angle_to_duty(angle)
-            self.lgpio.tx_pwm(self.chip, self.pin, self.freq, duty)
-            time.sleep(hold)
-        except Exception as e:
-            print(f"[❌ SERVO] set_angle error: {e}")
+# Target window for the centroid
+X_MIN, X_MAX = 335, 345
+Y_MIN, Y_MAX = 395, 405
 
-    def fire(self):
-        print("[🔫 FIRING TRIGGER!]")
-        self.set_angle(FIRE_ANGLE, hold=FIRE_HOLD)
-        self.set_angle(REST_ANGLE, hold=RETURN_HOLD)
+# Cooldown to avoid multiple rapid fires
+FIRE_COOLDOWN_SEC = 1.5
 
-    def cleanup(self):
-        if not self._dry_run:
-            try:
-                self.lgpio.tx_pwm(self.chip, self.pin, 0, 0)
-                self.lgpio.gpiochip_close(self.chip)
-                print("[✅ SERVO] Cleanup done")
-            except Exception as e:
-                print(f"[❌ SERVO] Cleanup error: {e}")
+def open_camera():
+    """Try to open a USB or Pi camera automatically."""
+    for dev in ("/dev/video0", "/dev/video1", "/dev/video2"):
+        cap = cv.VideoCapture(dev, cv.CAP_V4L2)
+        if cap.isOpened():
+            cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv.CAP_PROP_FRAME_HEIGHT, 480)
+            return cap
+    # fallback for Pi Camera Module
+    pipeline = (
+        "libcamerasrc ! video/x-raw, width=640, height=480, framerate=30/1 "
+        "! videoconvert ! appsink"
+    )
+    cap = cv.VideoCapture(pipeline, cv.CAP_GSTREAMER)
+    return cap if cap.isOpened() else None
 
-# =============================
-#        TARGET TRACKER
-# =============================
+def main():
+    cap = open_camera()
+    if not cap:
+        print("Error: Could not open camera.")
+        GPIO.cleanup()
+        return
 
-class TargetTracker:
-    def __init__(self, servo: ServoController):
-        print("[📸] Initializing camera...")
-        self.servo = servo
+    print("Running green detector... Press Ctrl+C to stop.")
+    last_print = 0.0
+    last_fire  = 0.0
 
-        self.cap = cv2.VideoCapture(CAMERA_INDEX, CAMERA_BACKEND)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-        self.cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    try:
+        # park servo at neutral to start
+        set_angle(90, settle=0.3)
 
-        time.sleep(2)  # give camera time to warm up
-
-        if not self.cap.isOpened():
-            raise RuntimeError("Cannot open camera (check /dev/video0 or permissions)")
-
-        print(f"[✅ CAMERA] Opened /dev/video{CAMERA_INDEX}")
-        ret, frame = self.cap.read()
-        if not ret:
-            raise RuntimeError("Camera read failed on first frame — check USB power/connection")
-
-        self.height, self.width = frame.shape[:2]
-        print(f"[📷] Resolution: {self.width}x{self.height} @ {CAMERA_FPS} FPS")
-
-        self.line_y = int(LINE_Y_REL * self.height)
-        self.seg_min_x = int(SEGMENT_MARGIN * self.width)
-        self.seg_max_x = int((1 - SEGMENT_MARGIN) * self.width)
-        print(f"[📏] Line y={self.line_y}, segment x=[{self.seg_min_x}, {self.seg_max_x}]")
-
-        self.tracks = {}
-        self.next_id = 0
-        self.cross_count = 0
-        self.frame_idx = 0
-        self.last_time = time.time()
-
-        self.backSub = cv2.createBackgroundSubtractorMOG2(
-            history=100, varThreshold=36, detectShadows=False
-        )
-        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-
-    def relation_to_line(self, top, bottom, ly, tol):
-        if bottom < ly - tol: return -1
-        if top > ly + tol: return +1
-        return 0
-
-    def x_overlaps_segment(self, x, w):
-        left, right = x, x + w
-        return not (right < self.seg_min_x or left > self.seg_max_x)
-
-    def detect_green_objects(self, frame):
-        fg_mask = self.backSub.apply(frame, learningRate=0.005)
-        _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.kernel)
-
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        green_mask = cv2.inRange(hsv, GREEN_LOW, GREEN_HIGH)
-        green_mask = cv2.medianBlur(green_mask, 3)
-
-        combined = cv2.bitwise_and(green_mask, fg_mask)
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        detections = []
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            area = cv2.contourArea(cnt)
-            if area < MIN_AREA:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                print("Warning: Failed to grab frame.")
                 continue
-            aspect = max(w, h) / max(min(w, h), 1)
-            fill_ratio = area / (w * h)
-            if aspect > ASPECT_MAX or fill_ratio < FILL_MIN:
+
+            hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+            mask = cv.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
+
+            # Morphological cleanup
+            k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5))
+            mask = cv.morphologyEx(mask, cv.MORPH_OPEN, k, iterations=1)
+            mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, k, iterations=1)
+
+            # Find contours (blobs of green)
+            cnts, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+            if not cnts:
                 continue
-            cx, cy = x + w // 2, y + h // 2
-            detections.append((x, y, w, h, cx, cy))
-        return detections, combined
 
-    def match_and_update_tracks(self, detections):
-        unmatched_dets = list(range(len(detections)))
-        unmatched_tracks = list(self.tracks.keys())
+            # Pick largest green blob
+            c = max(cnts, key=cv.contourArea)
+            area = cv.contourArea(c)
+            if area < 800:  # ignore tiny noise
+                continue
 
-        dist_list = []
-        for i, (_, _, _, _, cx, cy) in enumerate(detections):
-            for tid, t in self.tracks.items():
-                dx, dy = cx - t['cx'], cy - t['cy']
-                dist = (dx**2 + dy**2)**0.5
-                if dist <= MAX_DIST:
-                    dist_list.append((dist, i, tid))
+            # Compute centroid
+            M = cv.moments(c)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
 
-        dist_list.sort()
-        for _, i, tid in dist_list:
-            if i in unmatched_dets and tid in unmatched_tracks:
-                x, y, w, h, cx, cy = detections[i]
-                self.tracks[tid].update({
-                    'x': x, 'y': y, 'w': w, 'h': h,
-                    'cx': cx, 'cy': cy,
-                    'last_seen': self.frame_idx
-                })
-                unmatched_dets.remove(i)
-                unmatched_tracks.remove(tid)
+            now = time.time()
+            if now - last_print > 0.3:
+                print(f"working — center=({cx}, {cy})")
+                last_print = now
 
-        for i in unmatched_dets:
-            x, y, w, h, cx, cy = detections[i]
-            self.tracks[self.next_id] = {
-                'x': x, 'y': y, 'w': w, 'h': h,
-                'cx': cx, 'cy': cy,
-                'rel': self.relation_to_line(y, y+h, self.line_y, LINE_THICKNESS//2),
-                'first_seen': self.frame_idx,
-                'last_seen': self.frame_idx
-            }
-            self.next_id += 1
+            # Check if centroid is inside the target window
+            if (X_MIN <= cx <= X_MAX) and (Y_MIN <= cy <= Y_MAX):
+                # respect cooldown
+                if (now - last_fire) >= FIRE_COOLDOWN_SEC:
+                    time.sleep(0.76)
+                    fire_servo()
+                    last_fire = now
 
-        for tid in list(self.tracks.keys()):
-            if self.frame_idx - self.tracks[tid]['last_seen'] > MAX_MISSES:
-                del self.tracks[tid]
-
-    def check_crossings_and_draw(self, frame, detections):
-        now = time.time()
-        fps = 1.0 / max(now - self.last_time, 1e-6)
-        self.last_time = now
-
-        for tid, t in list(self.tracks.items()):
-            x, y, w, h = t['x'], t['y'], t['w'], t['h']
-            cx, cy = t['cx'], t['cy']
-            prev_rel = t['rel']
-            cur_rel = self.relation_to_line(y, y + h, self.line_y, LINE_THICKNESS//2)
-
-            if prev_rel == -1 and cur_rel == 0 and self.x_overlaps_segment(x, w):
-                self.cross_count += 1
-                self.servo.fire()
-
-            t['rel'] = cur_rel
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.circle(frame, (cx, cy), 3, (0, 255, 0), -1)
-
-        cv2.line(frame, (self.seg_min_x, self.line_y),
-                 (self.seg_max_x, self.line_y), (0, 0, 255), LINE_THICKNESS)
-        cv2.putText(frame, f"FPS:{fps:.1f}  Hits:{self.cross_count}", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        return frame
-
-    def run(self):
-        print("\n[▶️] Starting live tracker...")
-        print("Controls: 'q' quit | 'r' reset | '+'/'-' move line | 't' test servo")
-
-        try:
-            while True:
-                ret, frame = self.cap.read()
-                if not ret:
-                    print("[❌] Camera read failed")
-                    time.sleep(0.5)
-                    continue
-
-                self.frame_idx += 1
-                detections, mask = self.detect_green_objects(frame)
-                self.match_and_update_tracks(detections)
-                out = self.check_crossings_and_draw(frame.copy(), detections)
-
-                cv2.imshow("Tracker", out)
-                cv2.imshow("Mask", mask)
-
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('r'):
-                    self.cross_count = 0
-                    print("[🔁] Counter reset")
-                elif key == ord('+'):
-                    self.line_y = min(self.height - 20, self.line_y + 5)
-                elif key == ord('-'):
-                    self.line_y = max(20, self.line_y - 5)
-                elif key == ord('t'):
-                    print("[🧪] Manual fire test")
-                    self.servo.fire()
-        finally:
-            self.cap.release()
-            cv2.destroyAllWindows()
-
-# =============================
-#             MAIN
-# =============================
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        cap.release()
+        pwm.stop()
+        GPIO.cleanup()
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("🎯 Hackathon 2025 — Target Tracker (Low-Power 180p Version)")
-    print("=" * 50)
-
-    servo = ServoController(debug=False)
-    tracker = None
-    try:
-        tracker = TargetTracker(servo)
-        tracker.run()
-    except KeyboardInterrupt:
-        print("\n[🛑] Interrupted by user")
-    except Exception as e:
-        print(f"\n[❌] Error: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        if tracker:
-            tracker.cap.release()
-        cv2.destroyAllWindows()
-        servo.cleanup()
-        print("[👋] Done.")
+    main()
