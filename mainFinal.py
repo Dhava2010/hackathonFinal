@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Real-Time Green Target Tracker + Servo Trigger
-- Uses USB camera (default: /dev/video0 → index 0)
+Real-Time Green Target Tracker + Servo Trigger (Fixed Version)
+- Uses USB camera (default: /dev/video0)
 - Detects green objects crossing a horizontal line
 - Fires servo (GPIO 18) when crossing occurs
 """
@@ -17,34 +17,36 @@ import sys
 # =============================
 
 # 🔧 CAMERA
-CAMERA_INDEX = 2          # /dev/video0 — change if needed
+CAMERA_INDEX = 0          # ✅ fixed: /dev/video0 (use 0 instead of 2)
+CAMERA_BACKEND = cv2.CAP_V4L2  # ✅ use V4L2 backend on Linux
 
 # 🎯 DETECTION LINE (will auto-adjust to frame height)
-LINE_Y_REL = 0.70         # 70% down the frame (e.g., y = 0.7 * height)
+LINE_Y_REL = 0.70
 LINE_THICKNESS = 10
-SEGMENT_MARGIN = 0.2     # Keep line centered, covering middle 60%: [20%, 80%] of width
+SEGMENT_MARGIN = 0.2
 
 # 🟢 GREEN DETECTION (HSV)
 GREEN_LOW  = np.array([40,  50,  50])
 GREEN_HIGH = np.array([80, 255, 255])
-MIN_AREA = 1500           # Minimum contour area (pixels)
-ASPECT_MAX = 4.0          # Max w/h or h/w ratio for blob
-FILL_MIN = 0.3            # Min area/(w*h) to reject noise
+MIN_AREA = 1500
+ASPECT_MAX = 4.0
+FILL_MIN = 0.3
 
 # 🧠 TRACKING
-MAX_DIST = 80             # Max pixel distance to match track
+MAX_DIST = 80
 MAX_MISSES = 5
 MIN_FRAMES_TO_CONFIRM = 2
 
 # ⚙️ SERVO (GPIO 18 = physical Pin 12)
 SERVO_PIN = 18
-SERVO_FREQ = 50           # Hz
+SERVO_FREQ = 50
 SERVO_MIN_US = 500
 SERVO_MAX_US = 2500
 REST_ANGLE = 90
 FIRE_ANGLE = 30
 FIRE_HOLD = 0.12
 RETURN_HOLD = 0.08
+
 
 # =============================
 #        SERVO CONTROLLER
@@ -118,18 +120,21 @@ class ServoController:
 
 class TargetTracker:
     def __init__(self, servo: ServoController):
+        print("[📸] Initializing camera...")
         self.servo = servo
-        self.cap = cv2.VideoCapture(CAMERA_INDEX)
-        
-        # Verify camera
+
+        # ✅ use explicit backend for Linux
+        self.cap = cv2.VideoCapture(CAMERA_INDEX, CAMERA_BACKEND)
         if not self.cap.isOpened():
-            raise RuntimeError(f"Failed to open camera {CAMERA_INDEX}. Try 0, 1, or check with 'v4l2-ctl --list-devices'")
+            raise RuntimeError(f"Failed to open camera index {CAMERA_INDEX}. "
+                               "Try changing to 0/1 or check with 'v4l2-ctl --list-devices'.")
+
         print(f"[✅ CAMERA] Opened /dev/video{CAMERA_INDEX}")
 
         # Get frame size
         ret, frame = self.cap.read()
         if not ret:
-            raise RuntimeError("Camera read failed on first frame")
+            raise RuntimeError("Camera read failed on first frame — check USB connection.")
         self.height, self.width = frame.shape[:2]
         print(f"[📷] Resolution: {self.width}×{self.height}")
 
@@ -140,45 +145,40 @@ class TargetTracker:
         print(f"[📏] Line at y={self.line_y}, segment x=[{self.seg_min_x}, {self.seg_max_x}]")
 
         # Tracker state
-        self.tracks = {}          # id → {cx, cy, x, y, w, h, rel}
+        self.tracks = {}
         self.next_id = 0
         self.cross_count = 0
         self.frame_idx = 0
         self.last_time = time.time()
 
-        # Background subtractor (optional, but helps in static scenes)
         self.backSub = cv2.createBackgroundSubtractorMOG2(
             history=100, varThreshold=36, detectShadows=False
         )
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
     def relation_to_line(self, top, bottom, ly, tol):
-        if bottom < ly - tol: return -1   # above
-        if top > ly + tol: return +1      # below
-        return 0                           # touching
+        if bottom < ly - tol: return -1
+        if top > ly + tol: return +1
+        return 0
 
     def x_overlaps_segment(self, x, w):
         left, right = x, x + w
         return not (right < self.seg_min_x or left > self.seg_max_x)
 
     def detect_green_objects(self, frame):
-        # Optional: use background subtraction to reduce noise
         fg_mask = self.backSub.apply(frame, learningRate=0.005)
         _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.kernel)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, self.kernel)
 
-        # HSV green mask
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         green_mask = cv2.inRange(hsv, GREEN_LOW, GREEN_HIGH)
         green_mask = cv2.medianBlur(green_mask, 5)
 
-        # Combine: motion + green
         combined = cv2.bitwise_and(green_mask, fg_mask)
         combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, self.kernel)
         combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, self.kernel)
 
-        # Find contours
         contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         detections = []
         for cnt in contours:
@@ -195,11 +195,9 @@ class TargetTracker:
         return detections, combined
 
     def match_and_update_tracks(self, detections):
-        # Simple IoU-free nearest-neighbor matching
         unmatched_dets = list(range(len(detections)))
         unmatched_tracks = list(self.tracks.keys())
 
-        # Compute distances
         dist_list = []
         for i, (_, _, _, _, cx, cy) in enumerate(detections):
             for tid, t in self.tracks.items():
@@ -208,7 +206,6 @@ class TargetTracker:
                 if dist <= MAX_DIST:
                     dist_list.append((dist, i, tid))
 
-        # Greedy match (smallest distance first)
         dist_list.sort()
         for _, i, tid in dist_list:
             if i in unmatched_dets and tid in unmatched_tracks:
@@ -221,7 +218,6 @@ class TargetTracker:
                 unmatched_dets.remove(i)
                 unmatched_tracks.remove(tid)
 
-        # Promote unmatched detections to new tracks (after confirmation)
         for i in unmatched_dets:
             x, y, w, h, cx, cy = detections[i]
             self.tracks[self.next_id] = {
@@ -233,7 +229,6 @@ class TargetTracker:
             }
             self.next_id += 1
 
-        # Remove stale tracks
         for tid in list(self.tracks.keys()):
             if self.frame_idx - self.tracks[tid]['last_seen'] > MAX_MISSES:
                 del self.tracks[tid]
@@ -243,40 +238,35 @@ class TargetTracker:
         fps = 1.0 / max(now - self.last_time, 1e-6)
         self.last_time = now
 
-        # Process tracks
         for tid, t in list(self.tracks.items()):
             x, y, w, h = t['x'], t['y'], t['w'], t['h']
             cx, cy = t['cx'], t['cy']
             prev_rel = t['rel']
             cur_rel = self.relation_to_line(y, y + h, self.line_y, LINE_THICKNESS//2)
 
-            # Crossing: was above (-1) → now touching (0), and overlaps segment
             if prev_rel == -1 and cur_rel == 0 and self.x_overlaps_segment(x, w):
                 self.cross_count += 1
                 self.servo.fire()
 
             t['rel'] = cur_rel
-
-            # Draw bounding box & center
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
 
-        # Draw line segment
         cv2.line(frame,
                  (self.seg_min_x, self.line_y),
                  (self.seg_max_x, self.line_y),
                  (0, 0, 255), LINE_THICKNESS)
 
-        # HUD
-        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(frame, f"Hits: {self.cross_count}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(frame, f"Hits: {self.cross_count}", (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
 
         return frame
 
     def run(self):
         print("\n[▶️] Starting live tracker...")
-        print("Controls: 'q' = quit | 'r' = reset counter | '+'/'-' = adjust line up/down")
-        print("          Hold 't' to test fire servo (dry or real)")
+        print("Controls: 'q' = quit | 'r' = reset counter | '+'/'-' = adjust line | 't' = test fire")
 
         try:
             while True:
@@ -287,7 +277,6 @@ class TargetTracker:
 
                 self.frame_idx += 1
 
-                # Warm-up: skip first 10 frames for background model
                 if self.frame_idx <= 10:
                     self.backSub.apply(frame, learningRate=0.1)
                     cv2.imshow("Tracker", frame)
@@ -295,21 +284,13 @@ class TargetTracker:
                         break
                     continue
 
-                # Detect
                 detections, mask = self.detect_green_objects(frame)
-
-                # Track
                 self.match_and_update_tracks(detections)
+                out = self.check_crossings_and_draw(frame.copy(), detections)
 
-                # Render
-                out = frame.copy()
-                out = self.check_crossings_and_draw(out, detections)
-
-                # Show
                 cv2.imshow("Tracker", out)
                 cv2.imshow("Mask", mask)
 
-                # Keyboard controls
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
@@ -325,7 +306,6 @@ class TargetTracker:
                 elif key == ord('t'):
                     print("[🧪] Manual fire test")
                     self.servo.fire()
-
         finally:
             self.cap.release()
             cv2.destroyAllWindows()
@@ -337,10 +317,10 @@ class TargetTracker:
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("🎯 Hackathon 2025 — Target Tracker (Live)")
+    print("🎯 Hackathon 2025 — Target Tracker (Fixed Version)")
     print("=" * 50)
 
-    servo = ServoController(debug=False)  # Set debug=True to see pulse details
+    servo = ServoController(debug=False)
     tracker = None
 
     try:
