@@ -3,10 +3,17 @@ import numpy as np
 import time
 from collections import OrderedDict
 
-VIDEO_SOURCE = 0
+# -----------------------------
+# CONFIG
+# -----------------------------
+VIDEO_SOURCE = 0  # USB webcam index
+FPS_LIMIT = 10    # Limit FPS to avoid lag
+RES_WIDTH = 320   # Downscale width
+RES_HEIGHT = 240  # Downscale height
+
 LINE_THICKNESS = 10
-x1, y1 = 380, 1100
-x2, y2 = 650, 1100
+x1, y1 = 50, 180  # Adjusted for lower res
+x2, y2 = 270, 180
 line_y = y1
 SEG_MIN_X, SEG_MAX_X = min(x1, x2), max(x1, x2)
 TOL = LINE_THICKNESS // 2 + 2
@@ -15,12 +22,12 @@ GREEN_LOW = np.array([40, 50, 50])
 GREEN_HIGH = np.array([80, 255, 255])
 KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-WARMUP_FRAMES = 45
-MIN_COMPONENT_AREA = 2500
+WARMUP_FRAMES = 30
+MIN_COMPONENT_AREA = 500  # Lower for smaller resolution
 ASPECT_MAX = 6.0
 FILL_MIN = 0.35
 
-MAX_MATCH_DIST = 80
+MAX_MATCH_DIST = 50
 MAX_MISSES = 10
 RETAIN_MIN_FRAMES = 2
 
@@ -32,9 +39,11 @@ FIRE_ANGLE = 30
 REST_ANGLE = 90
 FIRE_HOLD = 0.12
 RETURN_HOLD = 0.08
-
 FIRE_COOLDOWN = 3.0
 
+# -----------------------------
+# UTILITY FUNCTIONS
+# -----------------------------
 def relation_to_line(top, bottom, ly, tol):
     if bottom < ly - tol:
         return -1
@@ -49,11 +58,14 @@ def x_overlaps_segment(x, w, seg_min_x, seg_max_x):
 def iou(a, b):
     ax, ay, aw, ah = a[:4]; bx, by, bw, bh = b[:4]
     x1, y1 = max(ax, bx), max(ay, by)
-    x2, y2 = min(ax+aw, bx+bw), min(ay+bh, by+bh)
+    x2, y2 = min(ax+aw, bx+bw), min(ay+ah, by+bh)
     inter = max(0, x2-x1) * max(0, y2-y1)
     u = aw*ah + bw*bh - inter
     return inter / u if u > 0 else 0.0
 
+# -----------------------------
+# SERVO CONTROLLER
+# -----------------------------
 class ServoController:
     def __init__(self, pin=SERVO_PIN, frequency=SERVO_FREQ, min_us=SERVO_MIN_US, max_us=SERVO_MAX_US, debug=False):
         self.pin = pin
@@ -83,15 +95,11 @@ class ServoController:
         pulse = self.min_us + (angle / 180.0) * pulse_range
         period = 1_000_000 / self.freq
         duty = (pulse / period) * 100.0
-        if self.debug:
-            print(f"[SERVO DEBUG] angle={angle:.1f} -> {pulse:.0f}us -> duty={duty:.2f}%")
         return duty
 
     def set_angle(self, angle, hold=0.1):
         self.current_angle = max(0, min(180, float(angle)))
         if self._dry:
-            if self.debug:
-                print(f"[SERVO DRY] set_angle({self.current_angle:.1f})")
             time.sleep(hold)
             return
         try:
@@ -106,12 +114,8 @@ class ServoController:
     def fire(self, angle=FIRE_ANGLE, rest=REST_ANGLE, hold=FIRE_HOLD, back=RETURN_HOLD):
         now = time.time()
         self.last_fire_time = now
-        print("[SERVO] FIRE")
         self.set_angle(angle, hold=hold)
         self.set_angle(rest, hold=back)
-
-    def center(self):
-        self.set_angle(90, hold=0.1)
 
     def off(self):
         if self._dry:
@@ -130,6 +134,9 @@ class ServoController:
         except Exception as e:
             print("cleanup error", e)
 
+# -----------------------------
+# GREEN MOTION COUNTER
+# -----------------------------
 class GreenMotionCounter:
     def __init__(self, servo: ServoController):
         self.servo = servo
@@ -141,9 +148,14 @@ class GreenMotionCounter:
         self.cross_count = 0
         self.frame_idx = 0
         self.prev_time = time.time()
-        self.cap = cv2.VideoCapture(VIDEO_SOURCE)
+        self.cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             raise RuntimeError("Cannot open video source")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, RES_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RES_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, FPS_LIMIT)
+        self.frame_time = 1.0 / FPS_LIMIT
+        self.last_frame_time = 0
 
     def _make_masks(self, frame):
         blur = cv2.GaussianBlur(frame, (5,5), 0)
@@ -235,8 +247,6 @@ class GreenMotionCounter:
                 if now - self.servo.last_fire_time >= FIRE_COOLDOWN:
                     self.cross_count += 1
                     self.servo.fire()
-                else:
-                    pass
             t['rel'] = cur_rel if cur_rel != 0 else 0
             cv2.rectangle(out, (x,y), (x+w,y+h), (0,255,0), 2)
             cv2.circle(out, (cx,cy), 4, (0,255,0), -1)
@@ -244,32 +254,44 @@ class GreenMotionCounter:
         now = time.time()
         fps = 1.0 / max(now - self.prev_time, 1e-6)
         self.prev_time = now
-        cv2.putText(out, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-        cv2.putText(out, f"Count: {self.cross_count}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,255), 3)
+        cv2.putText(out, f"FPS: {fps:.1f}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+        cv2.putText(out, f"Count: {self.cross_count}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
 
     def run(self):
         print("Press 'q' to quit  |  's' to save current frame")
         while self.cap.isOpened():
+            now = time.time()
+            if now - self.last_frame_time < self.frame_time:
+                time.sleep(self.frame_time - (now - self.last_frame_time))
+            self.last_frame_time = time.time()
+
             ok, frame = self.cap.read()
             if not ok:
                 print("End of stream")
                 break
             self.frame_idx += 1
+
+            # Resize frame
+            frame = cv2.resize(frame, (RES_WIDTH, RES_HEIGHT))
+
+            # Warmup for background subtractor
             if self.frame_idx <= WARMUP_FRAMES:
                 self.backSub.apply(frame, learningRate=0.5)
                 cv2.imshow("Detected Targets", frame)
                 if (cv2.waitKey(1) & 0xFF) == ord('q'):
                     break
                 continue
+
             gm = self._make_masks(frame)
             detections = self._connected_components(gm)
             unmatched_det = self._match_tracks(detections)
             self._promote_candidates(unmatched_det, detections)
             out = frame.copy()
             self._process_tracks_and_draw(out)
+
             cv2.imshow("Detected Targets", out)
             cv2.imshow("Moving GREEN only", gm)
-            key = cv2.waitKey(10) & 0xFF
+            key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('s'):
@@ -279,6 +301,9 @@ class GreenMotionCounter:
         self.cap.release()
         cv2.destroyAllWindows()
 
+# -----------------------------
+# MAIN
+# -----------------------------
 if __name__ == "__main__":
     servo = ServoController(pin=SERVO_PIN, frequency=SERVO_FREQ, min_us=SERVO_MIN_US, max_us=SERVO_MAX_US, debug=False)
     try:
