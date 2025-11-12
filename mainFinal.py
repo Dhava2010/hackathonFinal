@@ -17,7 +17,7 @@ import sys
 # =============================
 
 # 🔧 CAMERA
-CAMERA_INDEX = 1          # /dev/video0 — change if needed
+CAMERA_INDEX = 2          # /dev/video0 — change if needed
 
 # 🎯 DETECTION LINE (will auto-adjust to frame height)
 LINE_Y_REL = 0.70         # 70% down the frame (e.g., y = 0.7 * height)
